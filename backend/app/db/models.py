@@ -1,6 +1,7 @@
 """ORM 模型：对应 DESIGN.md §3.3 ER 图。"""
 
 import uuid
+from app.core.session_context import current_session_id
 from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
@@ -26,6 +27,8 @@ class User(Base):
 class KnowledgeNode(Base):
     __tablename__ = "knowledge_nodes"
 
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)
+
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     title: Mapped[str] = mapped_column(String(200))
@@ -44,6 +47,8 @@ class KnowledgeNode(Base):
 class KnowledgeEdge(Base):
     __tablename__ = "knowledge_edges"
 
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)
+
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     from_node: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_nodes.id"))
@@ -54,6 +59,8 @@ class KnowledgeEdge(Base):
 
 class Question(Base):
     __tablename__ = "questions"
+
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
@@ -80,6 +87,8 @@ class QuestionKnowledge(Base):
 class Document(Base):
     __tablename__ = "documents"
 
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)
+
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     filename: Mapped[str] = mapped_column(String(255))
@@ -95,6 +104,8 @@ class Document(Base):
 class Conflict(Base):
     __tablename__ = "conflicts"
 
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)
+
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     doc_id: Mapped[str | None] = mapped_column(
@@ -104,3 +115,9 @@ class Conflict(Base):
     existing_knowledge: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     diff_description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="待审")  # 待审/已接受/已拒绝/并存
+
+
+class GeneratedArtifact(Base):
+    __tablename__ = "generated_artifacts"
+    filename: Mapped[str] = mapped_column(String(255), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(80), index=True, default=current_session_id)

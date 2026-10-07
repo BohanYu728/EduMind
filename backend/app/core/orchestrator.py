@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import NamedTuple
 
+from fastapi import HTTPException
+
 from app.core.intent import TeachingIntent, analyze_intent, wants_interactive_content
 from app.generate.creative import generate_html_creative, save_html
 from app.generate.outline import generate_outline
@@ -28,9 +30,16 @@ class RetrievalResult(NamedTuple):
 
 
 async def retrieve_knowledge(
-    intent: TeachingIntent, top_k: int = 5, reference_doc_ids: list[str] | None = None
+    intent: TeachingIntent,
+    top_k: int = 5,
+    reference_doc_ids: list[str] | None = None,
+    use_reference_materials: bool | None = None,
 ) -> RetrievalResult:
     """RAG 语义检索（参考资料加权）+ 图谱邻接子图融合。向量库为空或检索失败时降级为空。"""
+    if use_reference_materials is False or (
+        use_reference_materials is True and not reference_doc_ids
+    ):
+        return RetrievalResult(context="", sources=[])
     query = " ".join([intent.topic, *intent.knowledge_points]).strip()
     if not query:
         return RetrievalResult(context="", sources=[])
@@ -39,14 +48,22 @@ async def retrieve_knowledge(
         from app.knowledge.vector_store import VectorStore
 
         emb = await get_llm().embed([query])
-        hits = VectorStore().search(emb[0], k=top_k, boost_doc_ids=reference_doc_ids or None)
+        options = {"allowed_doc_ids": reference_doc_ids} if use_reference_materials is True else {}
+        hits = VectorStore().search(
+            emb[0], k=top_k, boost_doc_ids=reference_doc_ids or None, **options
+        )
         chunks = [h["content"] for h in hits if h.get("content")]
         sources = _source_names([h["doc_id"] for h in hits])
     except Exception:
         logger.warning("知识检索失败，降级为空上下文", exc_info=True)
         return RetrievalResult(context="", sources=[])
     try:
-        context = _fused_context(chunks, [h["doc_id"] for h in hits])
+        # 明确选择文件时只使用这些文件的原文片段，避免图谱扩展带入未勾选资料。
+        context = (
+            "\n\n".join(chunks)
+            if use_reference_materials is True
+            else _fused_context(chunks, [h["doc_id"] for h in hits])
+        )
     except Exception:
         logger.warning("图谱邻接子图拉取失败，降级为仅片段上下文", exc_info=True)
         context = "\n\n".join(chunks)
@@ -117,67 +134,63 @@ def _assemble_context(
     return "\n\n".join(parts)
 
 
-async def orchestrate(message: str, reference_doc_ids: list[str] | None = None) -> dict:
-    """一次备课请求的完整编排：意图 → 检索（参考资料加权）→ 生成 PPT/Word/提纲。"""
+async def orchestrate(
+    message: str,
+    reference_doc_ids: list[str] | None = None,
+    outputs: list[str] | None = None,
+    use_reference_materials: bool | None = None,
+) -> dict:
+    """按教师选择生成材料；未传 outputs 的旧客户端保留原有行为。"""
     intent = await analyze_intent(message)
     intent_dict = intent.model_dump()
-    retrieval = await retrieve_knowledge(intent, reference_doc_ids=reference_doc_ids)
+    policy = (
+        {"use_reference_materials": use_reference_materials}
+        if use_reference_materials is not None
+        else {}
+    )
+    retrieval = await retrieve_knowledge(intent, reference_doc_ids=reference_doc_ids, **policy)
     knowledge = retrieval.context
-    # 溯源：回复文案、教案「参考资料」节共用同一份来源信息；未携带参考资料标识时保持现状
     references = retrieval.sources if reference_doc_ids else []
-
-    # 互动诉求命中（小游戏/动画）时，备课流程自动附带生成互动内容（单文件 HTML）
-    gen_calls = [
-        generate_ppt_structure(intent_dict, knowledge),
-        generate_word_structure(intent_dict, knowledge),
-        generate_outline(intent_dict, knowledge),
-    ]
-    if wants_interactive_content(intent):
-        gen_calls.append(generate_html_creative(knowledge))
-    results = await asyncio.gather(*gen_calls, return_exceptions=True)
-    ppt_slides, word_data, outline = results[0], results[1], results[2]
-    interactive_result = results[3] if len(results) > 3 else None
-    # 单个生成失败不拖垮整体，降级为空结果
-    slides: list[dict]
-    if isinstance(ppt_slides, BaseException):
-        logger.warning("PPT 生成失败: %s", ppt_slides)
-        slides = []
-    else:
-        slides = ppt_slides
-    # 课件主题化：页面角色差异化版式 + 风格偏好映射配色主题（简约/学术/活泼）在渲染层生效
-    ppt_path = render_ppt(slides, style=intent_dict.get("style", ""))
-
-    word: dict
-    if isinstance(word_data, BaseException):
-        logger.warning("Word 生成失败: %s", word_data)
-        word = {}
-    else:
-        word = word_data
-    word_path = render_word(word, references=references)
-    if isinstance(outline, BaseException):
-        logger.warning("提纲生成失败: %s", outline)
-        outline = ""
-
-    # 互动内容：单个生成失败不拖垮整体，降级为不附带；产物统一随机命名落盘
-    interactive: dict | None = None
-    if interactive_result is not None:
-        if isinstance(interactive_result, BaseException):
-            logger.warning("互动内容生成失败: %s", interactive_result)
-        elif str(interactive_result).strip():
-            path = save_html(str(interactive_result))
-            interactive = {
-                "html": str(interactive_result),
-                "path": path,
-                "filename": Path(path).name,
-            }
-
+    selected = set(outputs if outputs is not None else ["ppt", "word", "outline"])
+    if outputs is None and wants_interactive_content(intent):
+        selected.add("interactive")
+    calls = {}
+    if "ppt" in selected:
+        calls["ppt"] = generate_ppt_structure(intent_dict, knowledge)
+    if "word" in selected:
+        calls["word"] = generate_word_structure(intent_dict, knowledge)
+    if "outline" in selected:
+        calls["outline"] = generate_outline(intent_dict, knowledge)
+    if "interactive" in selected:
+        calls["interactive"] = generate_html_creative(knowledge or intent.topic)
+    values = await asyncio.gather(*calls.values(), return_exceptions=True)
+    results = dict(zip(calls, values))
+    for result in results.values():
+        if isinstance(result, HTTPException):
+            raise result
+        if isinstance(result, BaseException):
+            logger.error("教学材料生成失败: %s", result)
+            raise HTTPException(status_code=502, detail="教学材料生成失败，请重试")
+    ppt = word = interactive = None
+    if "ppt" in results:
+        slides = results["ppt"]
+        path = render_ppt(slides, style=intent_dict.get("style", ""))
+        ppt = {"slides": slides, "path": path, "filename": Path(path).name}
+    if "word" in results:
+        data = results["word"]
+        path = render_word(data, references=references)
+        word = {"data": data, "path": path, "filename": Path(path).name}
+    if "interactive" in results and str(results["interactive"]).strip():
+        html = str(results["interactive"])
+        path = save_html(html)
+        interactive = {"html": html, "path": path, "filename": Path(path).name}
     return {
         "intent": intent_dict,
         "knowledge_hits": bool(knowledge),
         "references": references,
-        "ppt": {"slides": slides, "path": ppt_path},
-        # data：教案完整结构随产物下发，供预览面板发起教案修改（与 slides 同理）
-        "word": {"data": word, "path": word_path},
-        "outline": outline,
+        "ppt": ppt,
+        "word": word,
+        "outline": results.get("outline", ""),
         "interactive": interactive,
+        "generated_outputs": list(calls),
     }

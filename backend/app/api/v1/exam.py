@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
+from app.api.v1.reference_policy import ReferenceSelection, reference_options
 from app.core.intent import TeachingIntent
 from app.core.orchestrator import retrieve_knowledge
 from app.generate.exam import generate_exam, render_exam, save_questions_to_bank
@@ -12,7 +13,7 @@ from app.generate.exam import generate_exam, render_exam, save_questions_to_bank
 router = APIRouter()
 
 
-class ExamGenerateRequest(BaseModel):
+class ExamGenerateRequest(ReferenceSelection):
     # 产物区透传上次备课意图；空意图时仅凭主题生成
     intent: dict = {}
     n: int = 5
@@ -37,7 +38,7 @@ async def generate_exam_paper(req: ExamGenerateRequest):
         # 意图结构不完整时退化为仅主题，一键生成不被前端字段变更卡死
         intent = _intent_from_topic(req.intent)
 
-    retrieval = await retrieve_knowledge(intent)
+    retrieval = await retrieve_knowledge(intent, **reference_options(req))
     questions = await generate_exam(intent.model_dump(), retrieval.context, n=req.n)
     if not questions:
         raise HTTPException(status_code=502, detail="试卷生成失败：模型未返回可解析的题目，请重试")

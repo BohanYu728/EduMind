@@ -100,6 +100,8 @@ async def detect_conflicts(
                     break
                 if old.title == title:
                     is_duplicate = True
+                    if doc_id and doc_id not in (old.source_docs or []):
+                        old.source_docs = [*(old.source_docs or []), doc_id]
             if not conflicted and is_duplicate:
                 duplicates.append(n)
         db.commit()

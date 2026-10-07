@@ -80,12 +80,36 @@ cd frontend && npm run dev
 | 变量 | 用途 |
 | --- | --- |
 | `DASHSCOPE_API_KEY` | 阿里云百炼：qwen LLM / 多模态 / Embedding / paraformer 录音转写 |
-| `DEEPSEEK_API_KEY` | DeepSeek（LLM 备选） |
+| `DEEPSEEK_API_KEY` | DeepSeek：文字生成、图片/视频帧理解；配合本地词面检索 |
 | `SILICONFLOW_API_KEY` | SiliconFlow（Embedding 备选） |
 | `MINERU_TOKEN` | MinerU 云端 PDF 解析 |
 | `BOCHA_API_KEY` | 博查网络搜索 |
 
 各 provider 由 `LLM_PROVIDER` / `ASR_PROVIDER` 切换，默认 `stub`（固定内容网关），保证无 Key 环境可跑通全部流程与测试。
+
+### 只使用 DeepSeek Key
+
+在 `backend/.env` 配置并重启后端：
+
+```env
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_VISION_MODEL=deepseek-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+ASR_PROVIDER=stub
+```
+
+备课、图谱知识提取、课件/教案/试卷/互动内容生成与修改使用 DeepSeek；图片和视频抽帧理解使用 `DEEPSEEK_VISION_MODEL`。
+模型名和地址可按账号支持的接口调整，默认值依据 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/vision/)。
+
+知识库使用本地词面特征检索，无需额外 embedding Key，不能等同于语义检索。独立索引为 `backend/data/vectors-local-v1.db`；首次启动自动从旧索引的文本及知识点标题重建，保留旧索引与原文件。
+如需手动重建，在 backend 执行 `.venv/Scripts/python.exe scripts/reindex_local.py`（重建时停止后端，避免并发上传）。
+语音转写仍是演示模式；真实语音需另配支持 ASR 的服务。PDF 使用本地文本层提取，扫描 PDF 的 OCR 仍需另配解析服务。联网搜索依然需要可选的博查 Key。
+
+密钥为空会明确提示未配置，鉴权、余额、限流和网络错误不会静默使用演示模型。
+可在 backend 执行 `.venv/Scripts/python.exe scripts/verify_deepseek.py` 验证真实连接（产生少量 API 用量）。
+单元测试固定使用 stub，不受本机真实 Key 配置影响。
 
 ## 运行测试
 

@@ -148,6 +148,7 @@ def test_generate_returns_502_when_llm_output_unparseable(monkeypatch, tmp_path)
         async def embed(self, texts):
             return [[0.0] * 8 for _ in texts]
 
+    monkeypatch.setattr(exam_module, "get_llm", lambda: BadProvider())
     monkeypatch.setattr(factory_module, "get_llm", lambda: BadProvider())
     monkeypatch.setattr(
         vector_store_module, "VectorStore", lambda: VectorStore(str(tmp_path / "v.db"))

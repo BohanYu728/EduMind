@@ -15,6 +15,21 @@ async def download_file(filename: str, inline: bool = False):
     """inline=true 时不附下载头：互动内容 HTML 可在浏览器直接打开互动（内联预览）。"""
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="非法文件名")
+    from app.db import SessionLocal
+    from app.db.models import GeneratedArtifact
+    from app.core.session_context import current_session_id
+
+    with SessionLocal() as db:
+        owner = (
+            db.query(GeneratedArtifact)
+            .execution_options(all_sessions=True)
+            .filter_by(filename=filename)
+            .first()
+        )
+        if (owner and owner.session_id != current_session_id()) or (
+            not owner and current_session_id() != "legacy"
+        ):
+            raise HTTPException(status_code=404, detail="当前会话没有这个文件")
     path = OUTPUT_DIR / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")

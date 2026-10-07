@@ -11,12 +11,22 @@ from pathlib import Path
 
 import sqlite_vec
 
+from app.config import settings
+from app.core.session_context import session_scope
+
 # 参考文档片段的距离折扣：等效排名加权（0.5 = 同距离下优先参考文档，可反超近一倍的非参考片段）
 REFERENCE_DISTANCE_FACTOR = 0.5
 
 
 class VectorStore:
-    def __init__(self, db_path: str = "data/vectors.db"):
+    def __init__(self, db_path: str | None = None):
+        if db_path is None:
+            db_path = (
+                "data/vectors-local-v1.db"
+                if settings.llm_provider.lower() == "deepseek"
+                else "data/vectors.db"
+            )
+        self.local_features = Path(db_path).name == "vectors-local-v1.db"
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -63,6 +73,7 @@ class VectorStore:
         query_embedding: list[float],
         k: int = 5,
         boost_doc_ids: Iterable[str] | None = None,
+        allowed_doc_ids: Iterable[str] | None = None,
     ) -> list[dict]:
         """KNN 检索，返回 [{chunk_id, distance, doc_id, content}]。空库返回 []。
 
@@ -85,9 +96,26 @@ class VectorStore:
                 "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
                 (json.dumps(query_embedding), fetch_k),
             ).fetchall()
+            if session_scope.get() is not None or allowed_doc_ids is not None:
+                from app.db import SessionLocal
+                from app.db.models import Document
+
+                with SessionLocal() as db:
+                    allowed = [r[0] for r in db.query(Document.id).all()]
+                if allowed_doc_ids is not None:
+                    allowed = list(set(allowed) & set(allowed_doc_ids))
+                rows = conn.execute(
+                    "SELECT v.rowid, vec_distance_L2(v.embedding, ?), c.doc_id, c.content "
+                    "FROM chunk_embeddings v JOIN chunks c ON v.rowid=c.id "
+                    "WHERE c.doc_id IN (SELECT value FROM json_each(?)) ORDER BY 2",
+                    (json.dumps(query_embedding), json.dumps(allowed)),
+                ).fetchall()
             hits = [
                 {"chunk_id": r[0], "distance": r[1], "doc_id": r[2], "content": r[3]} for r in rows
             ]
+            if self.local_features:
+                # 单位向量欧氏距离 sqrt(2) 表示零相似；低于 0.1 的词面重合不作来源。
+                hits = [hit for hit in hits if hit["distance"] < 1.34]
             if boost:
                 # 稳定排序：同折扣键下保持原始距离序；返回原始 distance，仅排名生效
                 hits.sort(
@@ -145,6 +173,18 @@ class VectorStore:
                 "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
                 (json.dumps(embedding), k),
             ).fetchall()
+            if session_scope.get() is not None:
+                from app.db import SessionLocal
+                from app.db.models import KnowledgeNode
+
+                with SessionLocal() as db:
+                    allowed = [r[0] for r in db.query(KnowledgeNode.id).all()]
+                rows = conn.execute(
+                    "SELECT t.node_id,t.title,vec_distance_cosine(v.embedding,?) "
+                    "FROM node_title_embeddings v JOIN node_titles t ON t.rowid=v.rowid "
+                    "WHERE t.node_id IN (SELECT value FROM json_each(?)) ORDER BY 3 LIMIT ?",
+                    (json.dumps(embedding), json.dumps(allowed), k),
+                ).fetchall()
             return [{"node_id": r[0], "title": r[1], "distance": r[2]} for r in rows]
         finally:
             conn.close()
@@ -162,6 +202,20 @@ class VectorStore:
             if old:
                 conn.execute("DELETE FROM node_title_embeddings WHERE rowid = ?", (old[0],))
                 conn.execute("DELETE FROM node_titles WHERE node_id = ?", (node_id,))
+                conn.commit()
+        finally:
+            conn.close()
+
+    def remove_document(self, doc_id: str) -> None:
+        conn = self._connect()
+        try:
+            if conn.execute("SELECT name FROM sqlite_master WHERE name='chunks'").fetchone():
+                ids = [
+                    r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))
+                ]
+                for chunk_id in ids:
+                    conn.execute("DELETE FROM chunk_embeddings WHERE rowid=?", (chunk_id,))
+                conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
                 conn.commit()
         finally:
             conn.close()

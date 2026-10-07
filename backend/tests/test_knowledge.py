@@ -12,6 +12,23 @@ client = TestClient(app)
 
 def test_search(monkeypatch, tmp_path):
     store = VectorStore(str(tmp_path / "v.db"))
+    from app.db import SessionLocal, init_db
+    from app.db.models import Document
+
+    init_db()
+    with SessionLocal() as db:
+        if db.get(Document, "doc1") is None:
+            db.add(
+                Document(
+                    id="doc1",
+                    user_id="default",
+                    filename="网络讲义",
+                    file_path="unused",
+                    file_type="txt",
+                    status="已完成",
+                )
+            )
+            db.commit()
     store.add("doc1", ["计算机网络基础内容"], [[1.0] * 8])
 
     monkeypatch.setattr(knowledge_module, "get_llm", lambda: StubProvider())

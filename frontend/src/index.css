@@ -1,11 +1,14 @@
 :root {
-  --accent: #4f7cff;
-  --border: #e3e5e8;
-  --card: #f2f3f5;
-  --muted: #888;
-  font-family: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei',
-    sans-serif;
-  color-scheme: light dark;
+  --accent: #242424;
+  --ink: #242424;
+  --border: #e6e6e6;
+  --card: #f1f1f1;
+  --muted: #777;
+  --bg: #ffffff;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+  color: var(--ink);
+  background: #fff;
 }
 
 * {
@@ -15,8 +18,33 @@
 body {
   margin: 0;
   font-size: 14px;
+  line-height: 1.6;
 }
 
-button {
+button,
+input {
   font-family: inherit;
+}
+
+button,
+a,
+input {
+  -webkit-tap-highlight-color: transparent;
+}
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 3px solid #91b9ff;
+  outline-offset: 3px;
+}
+button {
+  color: inherit;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+::selection {
+  background: #d3e3ff;
 }

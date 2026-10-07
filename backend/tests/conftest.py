@@ -8,6 +8,10 @@ import os
 import tempfile
 from pathlib import Path
 
+# 单元测试必须与用户的真实云端配置隔离。
+os.environ["LLM_PROVIDER"] = "stub"
+os.environ["ASR_PROVIDER"] = "stub"
+
 os.environ.setdefault(
     "DATABASE_URL",
     f"sqlite:///{Path(tempfile.mkdtemp(prefix='edumind-test-')) / 'test.db'}",

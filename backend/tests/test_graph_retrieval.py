@@ -49,6 +49,30 @@ class RecordingProvider(LLMProvider):
 def _install(monkeypatch, provider: RecordingProvider, store: VectorStore | None) -> None:
     """伪装意图分析 + 全部 get_llm 引用 + 向量库（orchestrator 延迟 import，逐模块替换）。"""
 
+    # API 检索现在要求片段有真实的文档归属，补齐测试种子记录。
+    if store:
+        from app.db.models import Document
+
+        with store._connect() as conn, SessionLocal() as db:
+            rows = (
+                conn.execute("SELECT DISTINCT doc_id FROM chunks")
+                if conn.execute("SELECT name FROM sqlite_master WHERE name='chunks'").fetchone()
+                else []
+            )
+            for (doc_id,) in rows:
+                if db.get(Document, doc_id) is None:
+                    db.add(
+                        Document(
+                            id=doc_id,
+                            user_id="default",
+                            filename=doc_id,
+                            file_path="unused",
+                            file_type="txt",
+                            status="已完成",
+                        )
+                    )
+            db.commit()
+
     async def fake_analyze(text):
         return TeachingIntent(
             topic="导数", duration_minutes=45, style="学术", objectives=["a"], key_points=["b"]

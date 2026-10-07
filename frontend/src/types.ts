@@ -16,7 +16,11 @@ export interface WordData {
   homework?: string[];
 }
 
+export type OutputType = "ppt" | "word" | "outline" | "interactive";
+export const DEFAULT_OUTPUTS: OutputType[] = ["ppt", "word", "outline"];
+
 export interface Artifacts {
+  generated_outputs?: OutputType[];
   intent: { topic: string };
   knowledge_hits: boolean;
   references: string[];
@@ -24,9 +28,9 @@ export interface Artifacts {
     slides: { title: string; points: string[] }[];
     path: string;
     filename: string;
-  };
+  } | null;
   // data：教案完整结构，供预览面板发起教案修改（当前版本随之更新）
-  word: { data?: WordData; path: string; filename: string };
+  word: { data?: WordData; path: string; filename: string } | null;
   outline: string;
   // 互动内容：意图互动诉求命中时自动附带，或产物区一键生成（单文件 HTML）
   interactive?: { html: string; filename: string } | null;
@@ -35,4 +39,15 @@ export interface Artifacts {
 export interface Message {
   role: "user" | "assistant";
   content: string;
+}
+
+export interface ExamPaper {
+  questions: {
+    type: string;
+    content: string;
+    answer: string;
+    knowledge_point?: string;
+  }[];
+  filename: string;
+  bank_saved: number;
 }

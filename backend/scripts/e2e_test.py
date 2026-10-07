@@ -40,18 +40,29 @@ def scenario(name: str):
     return deco
 
 
-@scenario("S1 冒烟：首页加载与四区结构")
+def new_session(page, name="TCP握手教案"):
+    page.locator(".session-new").click()
+    dialog = page.get_by_role("dialog", name="新建备课", exact=True)
+    dialog.get_by_role("textbox", name="会话名称").fill(name)
+    dialog.get_by_role("button", name="创建会话", exact=True).click()
+    expect(dialog).to_have_count(0)
+    expect(page.locator(".thread-title")).to_have_text(name)
+
+
+@scenario("S1 冒烟：工作区加载与材料入口")
 def s1_smoke(page):
     page.goto(BASE, timeout=60000)
     expect(page.locator(".logo")).to_have_text("EduMind")
-    expect(page.locator(".msg.assistant").first).to_contain_text("教学智能体", timeout=15000)
+    new_session(page)
+    expect(page.locator(".blank-thread")).to_be_visible()
+    expect(page.locator(".welcome-shell")).to_have_count(0)
     tabs = page.locator(".tabs button")
-    expect(tabs).to_have_count(4)
-    for tab in ("知识库", "产物预览", "冲突审核", "会话信息"):
+    expect(tabs).to_have_count(3)
+    for tab in ("知识库", "产物预览", "冲突审核"):
         expect(page.locator(".tabs button", has_text=tab)).to_be_visible()
 
 
-@scenario("S2 知识库：上传讲义 → 解析入库 → 图谱成型")
+@scenario("S2 知识库：上传解析 → 图谱预览、缩放与下载")
 def s2_upload(page):
     docx = Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx"
     doc = Document()
@@ -60,26 +71,60 @@ def s2_upload(page):
     doc.add_paragraph("释放连接需要四次挥手；滑动窗口机制实现流量控制。")
     doc.save(str(docx))
 
+    page.get_by_role("button", name="知识库", exact=True).click()
     page.locator("input[type=file]").set_input_files(str(docx))
     item = page.locator(".doc-item", has_text="edumind_e2e_tcp讲义.docx").first
     expect(item).to_be_visible(timeout=30000)
     expect(item.locator(".doc-status")).to_have_text("已完成", timeout=60000)
     expect(page.locator(".node-item").first).to_be_visible(timeout=30000)
 
+    page.get_by_role("button", name="生成知识图谱", exact=True).click()
+    dialog = page.get_by_role("dialog", name="知识图谱", exact=True)
+    expect(dialog).to_be_visible()
+    session_id = page.evaluate("JSON.parse(localStorage.getItem('edumind.sessions.v1')).activeId")
+    graph = page.request.get(BASE + "/api/v1/knowledge/graph", headers={"X-EduMind-Session": session_id}).json()
+    expect(dialog.locator(".graph-node")).to_have_count(len(graph["nodes"]))
+    expect(dialog.locator(".graph-edge")).to_have_count(len(graph["edges"]))
+    dialog.locator(".graph-node").first.click()
+    expect(dialog.locator(".graph-detail strong")).to_have_text(graph["nodes"][0]["title"])
+    dialog.get_by_role("button", name="放大图谱", exact=True).click()
+    expect(dialog.locator(".graph-toolbar")).to_contain_text("150%")
+    dialog.get_by_role("button", name="重置视图", exact=True).click()
+    expect(dialog.locator(".graph-toolbar")).to_contain_text("100%")
+    with page.expect_download() as download:
+        dialog.get_by_role("button", name="下载图谱 SVG", exact=True).click()
+    svg_path = ARTIFACTS / download.value.suggested_filename
+    download.value.save_as(str(svg_path))
+    from xml.etree import ElementTree
+    root = ElementTree.parse(svg_path).getroot()
+    assert root.tag == "{http://www.w3.org/2000/svg}svg"
+    svg_text = svg_path.read_text(encoding="utf-8")
+    assert all(node["title"] in svg_text for node in graph["nodes"])
+    page.screenshot(path=str(ARTIFACTS / "knowledge-graph-desktop.png"))
+    page.set_viewport_size({"width": 390, "height": 844})
+    assert not page.evaluate("document.documentElement.scrollWidth > innerWidth")
+    expect(dialog.get_by_role("button", name="关闭知识图谱")).to_be_visible()
+    page.screenshot(path=str(ARTIFACTS / "knowledge-graph-mobile.png"))
+    page.keyboard.press("Escape")
+    expect(dialog).to_have_count(0)
+    page.set_viewport_size({"width": 1440, "height": 900})
+
 
 @scenario("S3 备课对话：追问粒度 + 生成课件/教案/提纲")
 def s3_chat(page):
-    page.locator(".granularity button", has_text="精细").click()
-    expect(page.locator(".granularity button.active")).to_have_text("精细")
+    page.get_by_role("button", name="备课模式：标准", exact=True).click()
+    page.get_by_role("menuitemradio", name="精细", exact=True).click()
+    expect(page.get_by_role("button", name="备课模式：精细", exact=True)).to_be_visible()
 
-    inp = page.locator("input[placeholder*='教学需求']")
+    inp = page.get_by_role("textbox", name="教学需求")
     inp.fill("给大二学生讲 TCP 三次握手，45 分钟，学术风格")
     before = page.locator(".msg").count()
     page.locator("button", has_text="发送").click()
 
     # 备课完成 = 发送按钮恢复可用（sending 状态解除）
     expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=120000)
-    expect(page.locator("button", has_text="发送")).to_be_enabled()
+    expect(inp).to_be_editable()
+    expect(page.locator("button", has_text="发送")).to_be_disabled()  # 输入为空时阻止空发送
     assert page.locator(".msg").count() >= before + 2, "对话轮数未增加"
 
     # 意图不完整时后端先追问：补全要素再答，直至产物下发（stub 最多两三轮）
@@ -88,7 +133,7 @@ def s3_chat(page):
     for _ in range(3):
         if page.locator(".artifact-title", has_text="当前版本").count():
             break
-        inp = page.locator("input[placeholder*='教学需求']")
+        inp = page.get_by_role("textbox", name="教学需求")
         inp.fill(answer)
         page.locator("button", has_text="发送").click()
         expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=120000)
@@ -145,17 +190,17 @@ def s8_persist(page):
     assert page.locator(".msg", has_text="给大二学生讲").count() >= 1, "教师消息未恢复"
     page.locator(".tabs button", has_text="产物预览").click()
     expect(page.locator(".artifact-title", has_text="当前版本")).to_be_visible()
-    expect(page.locator(".granularity button.active")).to_have_text("精细")
+    expect(page.get_by_role("button", name="备课模式：精细", exact=True)).to_be_visible()
 
-    page.locator(".tabs button", has_text="会话信息").click()
-    expect(page.locator(".panel strong").first).to_contain_text("握手")  # 首条消息自动命名
+    expect(page.locator("a.btn", has_text="试卷（")).to_be_visible()
+    expect(page.locator(".thread-title")).to_contain_text("握手")  # 自定义名称刷新后保留
 
 
 @scenario("S9 多会话：新建 / 切换 / 两段式删除")
 def s9_sessions(page):
     page.locator(".session-wrap button.ghost", has_text="会话").click()
-    page.locator(".session-new").click()
-    expect(page.locator(".msg")).to_have_count(1, timeout=10000)  # 新会话仅欢迎语
+    new_session(page)
+    expect(page.locator(".msg")).to_have_count(0, timeout=10000)  # 新会话直接显示输入工作区
 
     # 切回旧会话：菜单内点击旧会话条目
     page.locator(".session-wrap button.ghost", has_text="会话").click()
@@ -168,9 +213,11 @@ def s9_sessions(page):
     page.locator(".session-wrap button.ghost", has_text="会话").click()
     expect(page.locator(".session-item.active")).to_have_count(1)
     page.locator(".session-item.active .session-delete").click()
-    expect(page.locator(".session-item.active .session-delete")).to_have_text("确认删除？")
+    expect(page.locator(".session-item.active .session-delete")).to_have_text(
+        "确认删除资料及会话？"
+    )
     page.locator(".session-item.active .session-delete").click()
-    expect(page.locator(".msg")).to_have_count(1, timeout=10000)  # 回落到新会话
+    expect(page.locator(".msg")).to_have_count(0, timeout=10000)  # 回落到空白会话
     expect(page.locator(".session-wrap button.ghost")).to_contain_text("会话（1）")
 
 
@@ -178,6 +225,216 @@ def s9_sessions(page):
 def s10_conflicts(page):
     page.locator(".tabs button", has_text="冲突审核").click()
     expect(page.locator(".panel", has_text="冲突待审")).to_be_visible()
+
+
+@scenario("S11 资料删除、会话隔离与零会话工作区")
+def s11_materials(page):
+    page.locator(".tabs button", has_text="知识库").click()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    page.locator("input[type=file]").set_input_files(
+        str(Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx")
+    )
+    expect(page.locator(".doc-item .doc-status").first).to_have_text("已完成", timeout=30000)
+    page.get_by_role("button", name="会话（1）", exact=True).click()
+    new_session(page)
+    expect(page.locator(".doc-item")).to_have_count(0)
+    page.get_by_role("button", name="会话（2）", exact=True).click()
+    page.locator(".session-item:not(.active) .session-main").click()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    expect(page.locator(".doc-item")).to_have_count(1)
+    page.locator(".doc-delete").click()
+    expect(page.get_by_role("alertdialog", name="删除资料确认")).to_contain_text(
+        "edumind_e2e_tcp讲义.docx"
+    )
+    page.get_by_role("button", name="取消", exact=True).click()
+    expect(page.locator(".doc-item")).to_have_count(1)
+    page.locator(".doc-delete").click()
+    page.get_by_role("button", name="确认删除资料", exact=True).click()
+    expect(page.locator(".doc-item")).to_have_count(0)
+    expect(page.locator(".node-item")).to_have_count(0)
+    expect(page.get_by_role("button", name="生成知识图谱", exact=True)).to_be_disabled()
+    for count in (2, 1):
+        page.get_by_role("button", name=f"会话（{count}）", exact=True).click()
+        page.locator(".session-item.active .session-delete").click()
+        page.locator(".session-item.active .session-delete").click()
+    expect(page.locator(".blank-thread")).to_be_visible()
+    page.reload()
+    expect(page.locator(".blank-thread")).to_be_visible()
+    expect(page.locator(".composer")).to_have_count(0)
+    expect(page.locator(".session-item")).to_have_count(0)
+    expect(page.locator(".context-panel")).to_have_count(0)
+    page.screenshot(path=str(ARTIFACTS / "workspace-desktop.png"), full_page=True)
+    for width in (390, 768):
+        page.set_viewport_size({"width": width, "height": 844})
+        assert not page.evaluate("document.documentElement.scrollWidth > innerWidth")
+        page.screenshot(path=str(ARTIFACTS / f"workspace-{width}.png"), full_page=True)
+    page.set_viewport_size({"width": 1440, "height": 900})
+    new_session(page)
+    expect(page.get_by_role("textbox", name="教学需求")).to_have_value("")
+    expect(page.locator(".msg.user")).to_have_count(0)
+
+
+@scenario("S12 旧资料集中迁移且新会话保持空库")
+def s12_legacy(page):
+    content = (Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx").read_bytes()
+    response = page.request.post(
+        BASE + "/api/v1/documents/upload",
+        multipart={
+            "file": {
+                "name": "以前的讲义.docx",
+                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "buffer": content,
+            }
+        },
+    )
+    assert response.ok
+    page.reload()
+    page.get_by_role("button", name="会话（2）", exact=True).click()
+    page.locator(".session-item", has_text="以前的资料").locator(".session-main").click()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    expect(page.locator(".doc-item")).to_contain_text("以前的讲义.docx")
+    page.get_by_role("button", name="会话（2）", exact=True).click()
+    new_session(page)
+    expect(page.locator(".doc-item")).to_have_count(0)
+
+
+@scenario("S13 生成内容多选与单份材料持久化")
+def s13_outputs(page):
+    for label in ("Word 教案", "教学提纲"):
+        page.get_by_role("checkbox", name=label, exact=True).uncheck()
+    page.get_by_role("textbox", name="教学需求").fill("讲TCP，开始生成")
+    page.get_by_role("button", name="发送", exact=True).click()
+    expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=60000)
+    page.get_by_role("button", name="产物预览", exact=True).click()
+    expect(page.locator("a.btn", has_text="PPT（")).to_be_visible()
+    expect(page.locator("a.btn", has_text="Word 教案")).to_have_count(0)
+    expect(page.locator("summary", has_text="查看教学提纲")).to_have_count(0)
+    page.reload()
+    expect(page.get_by_role("checkbox", name="Word 教案", exact=True)).not_to_be_checked()
+    page.get_by_role("button", name="产物预览", exact=True).click()
+    expect(page.locator("a.btn", has_text="PPT（")).to_be_visible()
+    page.get_by_role("checkbox", name="PPT 课件", exact=True).uncheck()
+    page.get_by_role("textbox", name="教学需求").fill("开始生成")
+    expect(page.get_by_role("button", name="发送", exact=True)).to_be_disabled()
+    page.get_by_role("checkbox", name="Word 教案", exact=True).check()
+    page.get_by_role("button", name="发送", exact=True).click()
+    expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=60000)
+    expect(page.locator("a.btn", has_text="Word 教案")).to_be_visible()
+    expect(page.locator("a.btn", has_text="PPT（")).to_have_count(0)
+    page.reload()
+    page.get_by_role("button", name="产物预览", exact=True).click()
+    expect(page.locator("a.btn", has_text="Word 教案")).to_be_visible()
+    expect(page.locator(".target-toggle button.active")).to_have_text("教案")
+
+
+@scenario("S14 参考资料开关、文件勾选与会话保存")
+def s14_reference_selection(page):
+    page.get_by_role("button", name="知识库", exact=True).click()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    page.locator("input[type=file]").set_input_files(
+        str(Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx")
+    )
+    expect(page.locator(".doc-item .doc-status").first).to_have_text("已完成", timeout=30000)
+    page.get_by_role("checkbox", name="使用参考资料", exact=True).check()
+    page.get_by_role("textbox", name="教学需求").fill("讲TCP，开始生成")
+    expect(page.get_by_role("button", name="发送", exact=True)).to_be_disabled()
+    page.get_by_role("checkbox", name="参考 edumind_e2e_tcp讲义.docx", exact=True).check()
+    expect(page.get_by_role("button", name="发送", exact=True)).to_be_enabled()
+    page.reload()
+    expect(page.get_by_role("checkbox", name="使用参考资料", exact=True)).to_be_checked()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    expect(
+        page.get_by_role("checkbox", name="参考 edumind_e2e_tcp讲义.docx", exact=True)
+    ).to_be_checked()
+    page.get_by_role("textbox", name="教学需求").fill("讲TCP，开始生成")
+    page.get_by_role("button", name="发送", exact=True).click()
+    expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=60000)
+    expect(page.locator(".msg.assistant").last).to_contain_text("本次命中的来源文档")
+    page.get_by_role("checkbox", name="使用参考资料", exact=True).uncheck()
+    page.get_by_role("textbox", name="教学需求").fill("开始生成")
+    page.get_by_role("button", name="发送", exact=True).click()
+    expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=60000)
+    expect(page.locator(".msg.assistant").last).to_contain_text("未使用上传资料")
+    page.get_by_role("button", name="会话（3）", exact=True).click()
+    new_session(page)
+    expect(page.get_by_role("checkbox", name="使用参考资料", exact=True)).not_to_be_checked()
+    expect(page.locator(".doc-item")).to_have_count(0)
+    page.get_by_role("button", name="知识库", exact=True).click()
+    page.locator("input[type=file]").set_input_files(
+        str(Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx")
+    )
+    expect(page.locator(".doc-item .doc-status").first).to_have_text("已完成", timeout=30000)
+    page.get_by_role("checkbox", name="使用参考资料", exact=True).check()
+    page.get_by_role("checkbox", name="参考 edumind_e2e_tcp讲义.docx", exact=True).check()
+    page.locator(".doc-delete").click()
+    page.get_by_role("button", name="确认删除资料", exact=True).click()
+    expect(page.locator(".doc-item")).to_have_count(0)
+    expect(
+        page.get_by_role("button", name="查看并勾选资料（已选 0 份）", exact=True)
+    ).to_be_visible()
+
+
+@scenario("S15 无会话时隐藏输入框，新建后上传和发送可用")
+def s15_direct_start(page):
+    while page.locator(".session-item").count():
+        page.locator(".session-item.active .session-delete").click()
+        page.locator(".session-item.active .session-delete").click()
+        expect(page.locator(".session-delete.confirm")).to_have_count(0)
+    expect(page.locator(".blank-thread")).to_be_visible()
+    expect(page.get_by_role("textbox", name="教学需求")).to_have_count(0)
+    new_session(page)
+    page.get_by_role("button", name="知识库", exact=True).click()
+    page.locator("input[type=file]").set_input_files(
+        str(Path(tempfile.gettempdir()) / "edumind_e2e_tcp讲义.docx")
+    )
+    expect(page.locator(".doc-item .doc-status").first).to_have_text("已完成", timeout=30000)
+    expect(page.locator(".session-item")).to_have_count(1)
+    page.reload()
+    page.get_by_role("button", name="知识库", exact=True).click()
+    expect(page.locator(".doc-item")).to_have_count(1)
+    page.locator(".session-item.active .session-delete").click()
+    page.locator(".session-item.active .session-delete").click()
+    expect(page.locator(".session-item")).to_have_count(0)
+    expect(page.locator(".composer")).to_have_count(0)
+    new_session(page)
+    page.get_by_role("textbox", name="教学需求").fill("讲TCP，开始生成")
+    page.get_by_role("button", name="发送", exact=True).click()
+    expect(page.locator("button", has_text="备课中…")).to_have_count(0, timeout=60000)
+    expect(page.locator(".session-item")).to_have_count(1)
+    expect(page.locator(".artifact-title", has_text="当前版本")).to_be_visible()
+    page.reload()
+    expect(page.locator(".msg.user")).to_contain_text("讲TCP")
+    expect(page.locator(".thread-title")).to_have_text("TCP握手教案")
+
+
+@scenario("S16 重命名当前及其他会话，取消和刷新保持内容")
+def s16_rename(page):
+    original = page.evaluate("JSON.parse(localStorage.getItem('edumind.sessions.v1')).sessions[0]")
+    page.locator(".session-item.active .session-rename").click()
+    dialog = page.get_by_role("dialog", name="重命名备课", exact=True)
+    expect(dialog.get_by_role("textbox", name="会话名称")).to_have_value("TCP握手教案")
+    dialog.get_by_role("textbox", name="会话名称").fill("   ")
+    expect(dialog.get_by_role("button", name="保存名称")).to_be_disabled()
+    dialog.get_by_role("button", name="取消", exact=True).click()
+    expect(page.locator(".thread-title")).to_have_text("TCP握手教案")
+    page.locator(".session-item.active .session-rename").click()
+    dialog.get_by_role("textbox", name="会话名称").fill("  TCP三次握手 · 演示课  ")
+    dialog.get_by_role("button", name="保存名称").click()
+    expect(page.locator(".thread-title")).to_have_text("TCP三次握手 · 演示课")
+    renamed = page.evaluate("JSON.parse(localStorage.getItem('edumind.sessions.v1')).sessions[0]")
+    for key in ("id", "messages", "artifacts", "outputs", "referenceDocIds"):
+        assert renamed[key] == original[key], f"重命名不应改变 {key}"
+    new_session(page, "第二节课")
+    page.locator(".session-item:not(.active) .session-rename").click()
+    dialog.get_by_role("textbox", name="会话名称").fill("TCP备课定稿")
+    dialog.get_by_role("button", name="保存名称").click()
+    expect(page.locator(".thread-title")).to_have_text("第二节课")
+    page.locator(".session-item:not(.active) .session-main").click()
+    expect(page.locator(".thread-title")).to_have_text("TCP备课定稿")
+    page.reload()
+    expect(page.locator(".thread-title")).to_have_text("TCP备课定稿")
+    page.get_by_role("button", name="产物预览", exact=True).click()
+    expect(page.locator(".artifact-title", has_text="当前版本")).to_be_visible()
 
 
 def main() -> int:
@@ -197,6 +454,12 @@ def main() -> int:
             s8_persist,
             s9_sessions,
             s10_conflicts,
+            s11_materials,
+            s12_legacy,
+            s13_outputs,
+            s14_reference_selection,
+            s15_direct_start,
+            s16_rename,
         ):
             fn(page)
         browser.close()

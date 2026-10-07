@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from app.api.v1.reference_policy import ReferenceSelection, reference_options
 from app.core.intent import intent_from_payload
 from app.core.orchestrator import retrieve_knowledge
 from app.generate.creative import generate_html_creative, save_html
@@ -15,7 +16,7 @@ from app.generate.creative import generate_html_creative, save_html
 router = APIRouter()
 
 
-class InteractiveGenerateRequest(BaseModel):
+class InteractiveGenerateRequest(ReferenceSelection):
     # 产物区透传上次备课意图；空意图时仅凭主题生成
     intent: dict = {}
 
@@ -35,7 +36,7 @@ def _is_single_file_html(html: str) -> bool:
 async def generate_interactive(req: InteractiveGenerateRequest):
     intent = intent_from_payload(req.intent)
 
-    retrieval = await retrieve_knowledge(intent)
+    retrieval = await retrieve_knowledge(intent, **reference_options(req))
     html = (await generate_html_creative(retrieval.context or intent.topic)).strip()
     if not _is_single_file_html(html):
         raise HTTPException(

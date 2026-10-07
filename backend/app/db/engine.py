@@ -1,9 +1,10 @@
 """数据库引擎与初始化。"""
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker, with_loader_criteria
 
 from app.config import settings
+from app.core.session_context import session_scope
 
 # SQLite 在 FastAPI 多线程下需关闭同线程检查
 engine = create_engine(
@@ -21,6 +22,16 @@ def _ensure_sqlite_columns() -> None:
         if cols and "is_reference" not in cols:
             conn.exec_driver_sql("ALTER TABLE documents ADD COLUMN is_reference BOOLEAN DEFAULT 0")
             conn.commit()
+        for table in ("documents", "knowledge_nodes", "knowledge_edges", "questions", "conflicts"):
+            columns = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+            if columns and "session_id" not in columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN session_id TEXT NOT NULL DEFAULT 'legacy'"
+                )
+                conn.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS ix_{table}_session_id ON {table}(session_id)"
+                )
+        conn.commit()
 
 
 def init_db() -> None:
@@ -43,3 +54,24 @@ def get_session():
         yield db
     finally:
         db.close()
+
+
+@event.listens_for(Session, "do_orm_execute")
+def enforce_session_scope(state):
+    """集中约束 ORM 查询，包括图谱扩展、冲突审核和题库关联。"""
+    scope = session_scope.get()
+    if scope is None or state.execution_options.get("all_sessions"):
+        return
+    from app.db.models import (
+        Conflict,
+        Document,
+        GeneratedArtifact,
+        KnowledgeEdge,
+        KnowledgeNode,
+        Question,
+    )
+
+    for model in (Document, KnowledgeNode, KnowledgeEdge, Question, Conflict, GeneratedArtifact):
+        state.statement = state.statement.options(
+            with_loader_criteria(model, model.session_id == scope, include_aliases=True)
+        )

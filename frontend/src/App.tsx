@@ -1,11 +1,26 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useMemo,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import "./App.css";
-import type { Artifacts, Granularity, Message } from "./types";
+import HelpDialog from "./HelpDialog";
+import NewSessionDialog from "./NewSessionDialog";
+import KnowledgeGraph, {
+  type GraphNode,
+  type GraphEdge,
+} from "./KnowledgeGraph";
+import ModeSelector from "./ModeSelector";
+import { MODE_DESCRIPTIONS } from "./modeOptions";
+import { sessionFetch, fileUrl } from "./sessionApi";
+import type { Artifacts, Message, ExamPaper, OutputType } from "./types";
 import {
   createSession,
   freshStore,
   loadSessionStore,
-  mapActiveSession,
   removeSession,
   saveSessionStore,
   sessionName,
@@ -30,18 +45,14 @@ interface ConflictItem {
 }
 
 // 试卷按需生成（产物区一键）：每题标注考查知识点；生成题目自动入题库（来源=自编）
-interface ExamPaper {
-  questions: {
-    type: string;
-    content: string;
-    answer: string;
-    knowledge_point?: string;
-  }[];
-  filename: string;
-  bank_saved: number;
-}
 
-const TABS = ["知识库", "产物预览", "冲突审核", "会话信息"] as const;
+const TABS = ["知识库", "产物预览", "冲突审核"] as const;
+const OUTPUT_OPTIONS: { id: OutputType; label: string }[] = [
+  { id: "ppt", label: "PPT 课件" },
+  { id: "word", label: "Word 教案" },
+  { id: "outline", label: "教学提纲" },
+  { id: "interactive", label: "互动内容" },
+];
 
 type ReviseTarget = "课件" | "教案";
 
@@ -56,11 +67,26 @@ function formatTime(iso: string): string {
 // 修改意见只作用单个产物，方向性调整提示回对话区说明。
 function PreviewPanel({
   artifacts,
+  sessionId,
+  exam,
+  setExam,
+  onBusy,
+  disabledBusy,
+  referencePolicy,
   revising,
   generatingInteractive,
   onRevise,
   onGenerateInteractive,
 }: {
+  referencePolicy: {
+    use_reference_materials: boolean;
+    reference_doc_ids: string[];
+  };
+  disabledBusy: boolean;
+  sessionId: string;
+  exam: ExamPaper | null;
+  setExam: (exam: ExamPaper | null) => void;
+  onBusy: (busy: boolean) => void;
   artifacts: Artifacts | null;
   revising: boolean;
   generatingInteractive: boolean;
@@ -68,27 +94,48 @@ function PreviewPanel({
   onGenerateInteractive: () => Promise<boolean>;
 }) {
   const [feedback, setFeedback] = useState("");
-  const [target, setTarget] = useState<ReviseTarget>("课件");
-  const [exam, setExam] = useState<ExamPaper | null>(null);
+  const [target, setTarget] = useState<ReviseTarget>(
+    artifacts?.ppt ? "课件" : "教案",
+  );
+  const reviseTarget: ReviseTarget =
+    target === "课件"
+      ? artifacts?.ppt
+        ? "课件"
+        : "教案"
+      : artifacts?.word
+        ? "教案"
+        : "课件";
+  const fetch = (url: string, options?: RequestInit) =>
+    sessionFetch(sessionId, url, options);
   const [generatingExam, setGeneratingExam] = useState(false);
   const [examError, setExamError] = useState("");
 
   if (!artifacts) {
     return (
-      <p className="placeholder">暂无产物，先去对话区输入教学需求生成一个吧</p>
+      <div className="empty-state">
+        <span className="empty-icon" aria-hidden="true">
+          ▤
+        </span>
+        <h3>生成后，你的教学材料会出现在这里</h3>
+        <p>
+          先在对话区说明主题、年级和时长。材料生成后，在这里下载课件、教案，或继续修改。
+        </p>
+        <div className="empty-checklist">PPT 课件 · Word 教案 · 教学提纲</div>
+      </div>
     );
   }
 
   // 一键生成试卷：透传本次备课意图，后端检索知识内容自编出题并入题库
   async function generateExam() {
-    if (generatingExam || !artifacts) return;
+    if (disabledBusy || generatingExam || !artifacts) return;
     setGeneratingExam(true);
+    onBusy(true);
     setExamError("");
     try {
       const res = await fetch("/api/v1/exam/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent: artifacts.intent }),
+        body: JSON.stringify({ intent: artifacts.intent, ...referencePolicy }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setExam(await res.json());
@@ -97,13 +144,14 @@ function PreviewPanel({
       setExamError("试卷生成失败，请重试");
     } finally {
       setGeneratingExam(false);
+      onBusy(false);
     }
   }
 
   async function revise() {
     const text = feedback.trim();
     if (!text || revising) return;
-    const ok = await onRevise(target, text);
+    const ok = await onRevise(reviseTarget, text);
     if (ok) setFeedback("");
   }
 
@@ -114,37 +162,41 @@ function PreviewPanel({
         {artifacts.knowledge_hits ? "已融合知识库" : "AI 直接生成"}）
       </div>
       <div className="artifact-buttons">
-        <a
-          className="btn"
-          href={`/api/v1/files/${artifacts.ppt.filename}`}
-          download
-        >
-          ⬇ PPT（{artifacts.ppt.slides.length} 页）
-        </a>
-        <a
-          className="btn"
-          href={`/api/v1/files/${artifacts.word.filename}`}
-          download
-        >
-          ⬇ Word 教案
-        </a>
+        {artifacts.ppt && (
+          <a
+            className="btn"
+            href={fileUrl(sessionId, artifacts.ppt.filename)}
+            download
+          >
+            ⬇ PPT（{artifacts.ppt.slides.length} 页）
+          </a>
+        )}
+        {artifacts.word && (
+          <a
+            className="btn"
+            href={fileUrl(sessionId, artifacts.word.filename)}
+            download
+          >
+            ⬇ Word 教案
+          </a>
+        )}
         <button
           className="btn"
           onClick={generateExam}
-          disabled={generatingExam}
+          disabled={disabledBusy || generatingExam}
           title="根据本次备课意图与知识库自编试卷，题目自动收入题库"
         >
           {generatingExam ? "出题中…" : "📝 生成试卷"}
         </button>
         {exam && (
-          <a className="btn" href={`/api/v1/files/${exam.filename}`} download>
+          <a className="btn" href={fileUrl(sessionId, exam.filename)} download>
             ⬇ 试卷（{exam.questions.length} 题）
           </a>
         )}
         {artifacts.interactive && (
           <a
             className="btn"
-            href={`/api/v1/files/${artifacts.interactive.filename}?inline=true`}
+            href={fileUrl(sessionId, artifacts.interactive.filename, true)}
             target="_blank"
             rel="noreferrer"
             title="在新标签页打开互动内容（HTML5 小游戏/动画）"
@@ -155,7 +207,7 @@ function PreviewPanel({
         <button
           className="btn"
           onClick={() => void onGenerateInteractive()}
-          disabled={generatingInteractive}
+          disabled={disabledBusy || generatingInteractive}
           title="按本次备课意图生成本节课的互动内容（HTML5 小游戏/知识点动画）"
         >
           {generatingInteractive ? "生成中…" : "✨ 生成互动内容"}
@@ -180,98 +232,294 @@ function PreviewPanel({
           </ol>
         </details>
       )}
-      <div className="target-toggle" role="group" aria-label="修改对象">
-        {(["课件", "教案"] as ReviseTarget[]).map((t) => (
-          <button
-            key={t}
-            className={t === target ? "active" : ""}
-            onClick={() => setTarget(t)}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-      <div className="revise-area">
-        <input
-          value={feedback}
-          onChange={(e) => setFeedback(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && revise()}
-          placeholder={
-            target === "课件"
-              ? "修改课件：简化某页 / 增加一个案例 / 调整顺序"
-              : "修改教案：调整环节 / 增加活动 / 改作业"
-          }
-        />
-        <button
-          onClick={revise}
-          disabled={revising || (target === "教案" && !artifacts.word.data)}
-        >
-          {revising ? "调整中…" : "修改"}
-        </button>
-      </div>
-      <p className="revise-hint">
-        💡 方向性调整（主题/学段/目标级变化）请回对话区说明
-      </p>
-      <details className="artifact-outline">
-        <summary>查看教学提纲</summary>
-        <pre>{artifacts.outline}</pre>
-      </details>
+      {(artifacts.ppt || artifacts.word) && (
+        <>
+          <div className="target-toggle" role="group" aria-label="修改对象">
+            {(["课件", "教案"] as ReviseTarget[])
+              .filter((t) =>
+                t === "课件" ? !!artifacts.ppt : !!artifacts.word,
+              )
+              .map((t) => (
+                <button
+                  key={t}
+                  className={t === reviseTarget ? "active" : ""}
+                  onClick={() => setTarget(t)}
+                >
+                  {t}
+                </button>
+              ))}
+          </div>
+          <div className="revise-area">
+            <input
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && revise()}
+              placeholder={
+                reviseTarget === "课件"
+                  ? "修改课件：简化某页 / 增加一个案例 / 调整顺序"
+                  : "修改教案：调整环节 / 增加活动 / 改作业"
+              }
+            />
+            <button
+              onClick={revise}
+              disabled={
+                disabledBusy ||
+                revising ||
+                (reviseTarget === "教案" && !artifacts.word?.data)
+              }
+            >
+              {revising ? "调整中…" : "修改"}
+            </button>
+          </div>
+          <p className="revise-hint">
+            💡 方向性调整（主题/学段/目标级变化）请回对话区说明
+          </p>
+        </>
+      )}
+      {artifacts.outline && (
+        <details className="artifact-outline">
+          <summary>查看教学提纲</summary>
+          <pre>{artifacts.outline}</pre>
+        </details>
+      )}
     </div>
   );
 }
 
-function KnowledgePanel({ refreshKey }: { refreshKey: number }) {
+function useSessionDocuments(sessionId: string, refreshKey: number) {
   const [docs, setDocs] = useState<Doc[]>([]);
-  const [nodes, setNodes] = useState<
-    { id: string; title: string; difficulty: string }[]
-  >([]);
-  const [edges, setEdges] = useState(0);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    async function load() {
+      try {
+        const response = await sessionFetch(sessionId, "/api/v1/documents");
+        if (!response.ok) throw new Error("资料列表加载失败，请稍后重试");
+        const data = await response.json();
+        if (cancelled) return;
+        setDocs(data.documents ?? []);
+        setError("");
+        if (
+          (data.documents ?? []).some((doc: Doc) =>
+            ["处理中", "解析中"].includes(doc.status),
+          )
+        )
+          timer = window.setTimeout(load, 2000);
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "资料列表加载失败");
+          timer = window.setTimeout(load, 3000);
+        }
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [sessionId, refreshKey]);
+  return { docs, error };
+}
+
+function KnowledgePanel({
+  refreshKey,
+  sessionId,
+  disabled,
+  onChange,
+  docs,
+  useReferences,
+  selectedIds,
+  onToggleReference,
+  onUpload,
+  uploading,
+}: {
+  onUpload: () => void;
+  uploading: boolean;
+  docs: Doc[];
+  useReferences: boolean;
+  selectedIds: string[];
+  onToggleReference: (id: string) => void;
+  refreshKey: number;
+  sessionId: string;
+  disabled: boolean;
+  onChange: (deletedId: string) => void;
+}) {
+  const [pendingDelete, setPendingDelete] = useState<Doc | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
+  async function deleteDoc() {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    setError("");
+    try {
+      const res = await sessionFetch(
+        sessionId,
+        `/api/v1/documents/${pendingDelete.id}`,
+        { method: "DELETE" },
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "删除失败，请重试");
+      setPendingDelete(null);
+      onChange(pendingDelete.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "删除失败，请重试");
+    } finally {
+      setDeleting(false);
+    }
+  }
+  const [nodes, setNodes] = useState<GraphNode[]>([]);
+  const [edges, setEdges] = useState<GraphEdge[]>([]);
+  const [graphOpen, setGraphOpen] = useState(false);
+  const [graphError, setGraphError] = useState("");
+  const [graphLoading, setGraphLoading] = useState(true);
+  const [graphRefresh, setGraphRefresh] = useState(0);
 
   // refreshKey 变化（如刚完成上传）时重新拉取；存在「处理中」文档时轮询直至终态
   useEffect(() => {
-    let timer: number | undefined;
-    const load = () => {
-      fetch("/api/v1/documents")
-        .then((r) => r.json())
-        .then((d) => {
-          setDocs(d.documents ?? []);
-          if (
-            (d.documents ?? []).some(
-              (x: Doc) => x.status === "处理中" || x.status === "解析中",
-            )
-          ) {
-            timer = window.setTimeout(load, 2000);
-          }
-        })
-        .catch(() => {});
-      fetch("/api/v1/knowledge/graph")
-        .then((r) => r.json())
-        .then((d) => {
-          setNodes(d.nodes ?? []);
-          setEdges((d.edges ?? []).length);
-        })
-        .catch(() => {});
+    let cancelled = false;
+    async function load() {
+      setGraphLoading(true);
+      setGraphError("");
+      try {
+        const response = await sessionFetch(
+          sessionId,
+          "/api/v1/knowledge/graph",
+        );
+        if (!response.ok) throw new Error("知识图谱加载失败，请重试");
+        const data = await response.json();
+        if (cancelled) return;
+        setNodes(data.nodes ?? []);
+        setEdges(data.edges ?? []);
+      } catch {
+        if (!cancelled) setGraphError("知识图谱加载失败，请重试");
+      } finally {
+        if (!cancelled) setGraphLoading(false);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
     };
-    load();
-    return () => window.clearTimeout(timer);
-  }, [refreshKey]);
+  }, [refreshKey, sessionId, docs, graphRefresh]);
 
   return (
     <div className="panel">
-      <h4>📁 已上传文档（{docs.length}）</h4>
+      {graphOpen && (
+        <KnowledgeGraph
+          nodes={nodes}
+          edges={edges}
+          onClose={() => setGraphOpen(false)}
+        />
+      )}
+      {pendingDelete && (
+        <div
+          className="delete-confirm"
+          role="alertdialog"
+          aria-label="删除资料确认"
+        >
+          <strong>删除「{pendingDelete.filename}」？</strong>
+          <p>
+            原文件和这份资料提取的知识将从当前会话移除，已生成的教学材料会保留。
+          </p>
+          {error && (
+            <p role="alert" className="action-error">
+              {error}
+            </p>
+          )}
+          <div>
+            <button onClick={() => setPendingDelete(null)} disabled={deleting}>
+              取消
+            </button>
+            <button
+              className="danger-button"
+              onClick={() => void deleteDoc()}
+              disabled={deleting}
+            >
+              {deleting ? "删除中…" : "确认删除资料"}
+            </button>
+          </div>
+        </div>
+      )}
+      <p className="scope-note">
+        {useReferences
+          ? "勾选本次要参考的资料，解析完成后可选用"
+          : "资料保存在当前会话，开启“使用参考资料”后可勾选"}
+      </p>
+      <div className="documents-toolbar">
+        <h4>📁 已上传文档（{docs.length}）</h4>
+        <button
+          className="materials-upload"
+          type="button"
+          disabled={disabled}
+          onClick={onUpload}
+          aria-label="上传资料"
+          title="上传资料并保存在当前会话"
+        >
+          {uploading ? "上传中…" : "＋ 上传资料"}
+        </button>
+      </div>
       {docs.length === 0 && (
-        <p className="placeholder">还没有上传资料，用输入框旁的 📎 上传</p>
+        <p className="placeholder">
+          暂时没有资料。点击“上传资料”添加教材或讲义，也可以直接开始备课。
+        </p>
       )}
       {docs.map((d) => (
         <div key={d.id} className="doc-item">
-          <span className="doc-name">{d.filename}</span>
-          {d.is_reference && <span className="tag">参考资料</span>}
+          {useReferences ? (
+            <label className="doc-reference">
+              <input
+                type="checkbox"
+                aria-label={`参考 ${d.filename}`}
+                checked={selectedIds.includes(d.id)}
+                disabled={disabled || !["已完成", "有冲突"].includes(d.status)}
+                onChange={() => onToggleReference(d.id)}
+              />
+              <span className="doc-name">{d.filename}</span>
+            </label>
+          ) : (
+            <span className="doc-name">{d.filename}</span>
+          )}
+          {useReferences && selectedIds.includes(d.id) && (
+            <span className="tag">已选参考</span>
+          )}
           <span className={`doc-status ${d.status}`}>{d.status}</span>
+          <button
+            className="doc-delete"
+            aria-label={`删除资料 ${d.filename}`}
+            disabled={
+              disabled || deleting || ["处理中", "解析中"].includes(d.status)
+            }
+            onClick={() => {
+              setError("");
+              setPendingDelete(d);
+            }}
+          >
+            删除
+          </button>
         </div>
       ))}
-      <h4>
-        🧠 知识图谱（{nodes.length} 节点 / {edges} 关系）
-      </h4>
+      <div className="knowledge-toolbar">
+        <h4>
+          提取的知识点（{nodes.length} 个 / {edges.length} 条关联）
+        </h4>
+        <button
+          type="button"
+          aria-haspopup="dialog"
+          disabled={graphLoading || !nodes.length || !!graphError}
+          onClick={() => setGraphOpen(true)}
+        >
+          {graphLoading ? "加载中…" : "生成知识图谱"}
+        </button>
+      </div>
+      {graphError && (
+        <p className="action-error" role="alert">
+          {graphError}{" "}
+          <button onClick={() => setGraphRefresh((n) => n + 1)}>
+            重新加载图谱
+          </button>
+        </p>
+      )}
       {nodes.length === 0 && (
         <p className="placeholder">上传资料后自动提取知识点</p>
       )}
@@ -281,11 +529,18 @@ function KnowledgePanel({ refreshKey }: { refreshKey: number }) {
           {n.difficulty && <span className="tag">{n.difficulty}</span>}
         </div>
       ))}
+      {nodes.length > 30 && (
+        <p className="placeholder">
+          列表展示前 30 个知识点，生成图谱可查看全部知识点。
+        </p>
+      )}
     </div>
   );
 }
 
-function ConflictPanel() {
+function ConflictPanel({ sessionId }: { sessionId: string }) {
+  const fetch = (url: string, options?: RequestInit) =>
+    sessionFetch(sessionId, url, options);
   const [conflicts, setConflicts] = useState<ConflictItem[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -300,8 +555,17 @@ function ConflictPanel() {
   }
 
   useEffect(() => {
-    void load();
-  }, []);
+    let cancelled = false;
+    sessionFetch(sessionId, "/api/v1/conflicts")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!cancelled) setConflicts(d.conflicts ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId]);
 
   // 教师三选一（ADR-0001）：接受新=替换旧节点；保留旧=丢弃新知；并存=双留并标注差异
   async function review(id: string, action: "接受新" | "保留旧" | "并存") {
@@ -327,7 +591,9 @@ function ConflictPanel() {
         ⚠️ 冲突待审（{conflicts.filter((c) => c.status === "待审").length}）
       </h4>
       {conflicts.length === 0 && (
-        <p className="placeholder">暂无冲突，上传的新知识与已有图谱一致</p>
+        <p className="placeholder">
+          暂时没有需要审核的知识差异。上传资料后，如果发现不同说法，会在这里提醒你。
+        </p>
       )}
       {conflicts.map((c) => (
         <div key={c.id} className="conflict-item">
@@ -377,117 +643,174 @@ function ConflictPanel() {
   );
 }
 
-function SessionPanel({
-  name,
-  granularity,
-  msgCount,
+function Workspace({
+  store,
+  setStore,
+  initialDraft,
+  active,
 }: {
-  name: string;
-  granularity: Granularity;
-  msgCount: number;
+  active: StoredSession;
+  store: SessionStore;
+  setStore: Dispatch<SetStateAction<SessionStore>>;
+  initialDraft: string;
 }) {
-  return (
-    <div className="panel">
-      <h4>当前会话</h4>
-      <p>
-        会话名称：<strong>{name}</strong>
-      </p>
-      <p>
-        追问粒度：<strong>{granularity}</strong>
-      </p>
-      <p>对话轮数：{msgCount}</p>
-      <p className="placeholder">已确认的教学要素会显示在这里（开发中）</p>
-      <p className="placeholder">会话仅保存在本浏览器，刷新或重开后自动恢复</p>
-    </div>
-  );
-}
-
-function App() {
-  // 会话本地持久化：消息、生成物、追问粒度都挂在当前会话上，store 是唯一事实来源；
-  // 变更即落 localStorage，刷新或重开浏览器完整恢复（读取失败回落全新会话）。
-  const [store, setStore] = useState<SessionStore>(
-    () => loadSessionStore() ?? freshStore(),
-  );
-  const active: StoredSession =
-    store.sessions.find((s) => s.id === store.activeId) ?? store.sessions[0];
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(initialDraft);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const renamingSession = store.sessions.find((s) => s.id === renamingId);
+  const [materialsOpen, setMaterialsOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("知识库");
   const [sending, setSending] = useState(false);
-  const [markReference, setMarkReference] = useState(false);
   const [listening, setListening] = useState(false);
   const [revising, setRevising] = useState(false);
   const [generatingInteractive, setGeneratingInteractive] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
-  const [kbRefresh, setKbRefresh] = useState(0); // 上传后触发知识库面板刷新
+  const [examBusy, setExamBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [deletingSession, setDeletingSession] = useState(false);
+  const [sessionError, setSessionError] = useState("");
+  const busy =
+    sending ||
+    revising ||
+    generatingInteractive ||
+    examBusy ||
+    uploading ||
+    deletingSession;
+  const fetch = (url: string, options?: RequestInit) =>
+    sessionFetch(active.id, url, options);
+  const [kbRefresh, setKbRefresh] = useState(0);
+  const { docs, error: documentsError } = useSessionDocuments(
+    active.id,
+    kbRefresh,
+  );
+  const selectedReferenceIds = active.referenceDocIds.filter((id) =>
+    docs.some((d) => d.id === id && ["已完成", "有冲突"].includes(d.status)),
+  );
+  const referencePolicy = {
+    use_reference_materials: active.useReferenceMaterials,
+    reference_doc_ids: active.useReferenceMaterials ? selectedReferenceIds : [],
+  };
+  const referencesReady =
+    !active.useReferenceMaterials ||
+    (selectedReferenceIds.length > 0 && !documentsError);
+  function toggleReference(id: string) {
+    updateActive((s) => ({
+      referenceDocIds: s.referenceDocIds.includes(id)
+        ? s.referenceDocIds.filter((x) => x !== id)
+        : [...s.referenceDocIds, id],
+    }));
+  }
+  // 上传后触发知识库面板刷新
   const recognitionRef = useRef<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const teachingInputRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
-    saveSessionStore(store);
-  }, [store]);
+  useEffect(() => () => recognitionRef.current?.stop(), []);
 
   // 当前会话更新统一入口（消息/生成物/追问粒度），顺带刷新 updatedAt 供会话列表排序
   function updateActive(fn: (s: StoredSession) => Partial<StoredSession>) {
-    setStore((st) => mapActiveSession(st, (s) => ({ ...s, ...fn(s) })));
+    setStore((st) => {
+      const current = st.sessions.find((s) => s.id === active.id) ?? active;
+      const updated = {
+        ...current,
+        ...fn(current),
+        updatedAt: new Date().toISOString(),
+      };
+      return {
+        ...st,
+        activeId: active.id,
+        sessions: st.sessions.some((s) => s.id === active.id)
+          ? st.sessions.map((s) => (s.id === active.id ? updated : s))
+          : [updated, ...st.sessions],
+      };
+    });
   }
 
   function appendMessages(...msgs: Message[]) {
     updateActive((s) => ({ messages: [...s.messages, ...msgs] }));
   }
 
-  // 多会话：新建 / 切换 / 删除；删空回落全新会话，保证界面始终可用
-  function startNewSession() {
-    const s = createSession();
+  // 多会话：新建 / 切换 / 删除；删空后展示新建备课欢迎页
+  function startNewSession(name: string) {
+    if (busy) return;
+    const s = { ...createSession(), name, nameManuallySet: true };
     setStore((st) => ({
       ...st,
       activeId: s.id,
       sessions: [s, ...st.sessions],
     }));
     setMenuOpen(false);
+    setNewSessionOpen(false);
     setPendingDeleteId(null);
   }
 
   function switchTo(id: string) {
+    if (busy) return;
     setStore((st) => ({ ...st, activeId: id }));
     setMenuOpen(false);
     setPendingDeleteId(null);
   }
 
-  function deleteSession(id: string) {
+  function renameSession(name: string) {
+    if (busy || !renamingId) return;
+    setStore((st) => ({
+      ...st,
+      sessions: st.sessions.map((s) =>
+        s.id === renamingId
+          ? {
+              ...s,
+              name,
+              nameManuallySet: true,
+              updatedAt: new Date().toISOString(),
+            }
+          : s,
+      ),
+    }));
+    setRenamingId(null);
+  }
+
+  async function deleteSession(id: string) {
+    if (busy) return;
     if (pendingDeleteId !== id) {
       setPendingDeleteId(id); // 两段式确认，防误删
       return;
     }
-    setStore((st) => removeSession(st, id));
-    setPendingDeleteId(null);
-    setMenuOpen(false);
+    setDeletingSession(true);
+    setSessionError("");
+    try {
+      const res = await sessionFetch(id, `/api/v1/sessions/${id}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "删除会话失败，请重试");
+      setStore((st) => removeSession(st, id));
+      setPendingDeleteId(null);
+      setMenuOpen(false);
+    } catch (e) {
+      setSessionError(e instanceof Error ? e.message : "删除会话失败，请重试");
+    } finally {
+      setDeletingSession(false);
+    }
   }
 
   async function send() {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || busy || active.outputs.length === 0 || !referencesReady)
+      return;
     const userMsg: Message = { role: "user", content: text };
     const history = [...active.messages, userMsg];
     // 首条教师消息到达时给会话命名，便于按班级/课程区分
     const isFirstUserMsg = active.messages.every((m) => m.role !== "user");
     updateActive((s) => ({
       messages: [...s.messages, userMsg],
-      ...(isFirstUserMsg ? { name: sessionName(history) ?? s.name } : {}),
+      ...(isFirstUserMsg && !s.nameManuallySet
+        ? { name: sessionName(history) ?? s.name }
+        : {}),
     }));
     setInput("");
     setSending(true);
-    // 参考资料：已标记且解析完成的文档 id，随备课请求下发（检索加权 + 溯源）
-    let referenceDocIds: string[] = [];
-    try {
-      const dres = await fetch("/api/v1/documents");
-      const ddata = await dres.json();
-      referenceDocIds = (ddata.documents ?? [])
-        .filter((d: Doc) => d.is_reference && d.status === "已完成")
-        .map((d: Doc) => d.id);
-    } catch {
-      // 参考资料列表获取失败不阻断备课，退化为无参考标识
-    }
     try {
       const res = await fetch("/api/v1/chat", {
         method: "POST",
@@ -495,15 +818,21 @@ function App() {
         body: JSON.stringify({
           messages: history.map((m) => ({ role: m.role, content: m.content })),
           granularity: active.granularity,
-          reference_doc_ids: referenceDocIds,
+          ...referencePolicy,
+          outputs: active.outputs,
         }),
       });
       const data = await res.json();
       const artifacts = data.artifacts;
-      if (artifacts) updateActive(() => ({ artifacts }));
+      if (artifacts) {
+        updateActive(() => ({ artifacts, exam: null }));
+        setActiveTab("产物预览");
+        setMaterialsOpen(true);
+      }
       appendMessages({
         role: "assistant",
-        content: data.content ?? `（后端响应异常：${res.status}）`,
+        content:
+          data.content ?? data.detail ?? `（后端响应异常：${res.status}）`,
       });
     } catch {
       appendMessages({
@@ -522,10 +851,11 @@ function App() {
     feedback: string,
   ): Promise<boolean> {
     const lastArtifacts = active.artifacts;
-    if (!lastArtifacts || revising) return false;
+    if (!lastArtifacts || busy) return false;
     setRevising(true);
     try {
       if (target === "课件") {
+        if (!lastArtifacts.ppt) return false;
         const res = await fetch("/api/v1/revise", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -538,12 +868,14 @@ function App() {
             ...lastArtifacts,
             ppt: {
               ...lastArtifacts.ppt,
+              path: data.path ?? lastArtifacts.ppt?.path ?? "",
               slides: data.slides,
               filename: data.filename,
             },
           },
         }));
       } else {
+        if (!lastArtifacts.word) return false;
         const res = await fetch("/api/v1/revise/word", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -560,6 +892,7 @@ function App() {
             ...lastArtifacts,
             word: {
               ...lastArtifacts.word,
+              path: data.path ?? lastArtifacts.word?.path ?? "",
               data: data.word,
               filename: data.filename,
             },
@@ -579,13 +912,16 @@ function App() {
   // 对话中的互动诉求命中时由后端自动附带，无需教师额外操作。
   async function generateInteractive(): Promise<boolean> {
     const lastArtifacts = active.artifacts;
-    if (!lastArtifacts || generatingInteractive) return false;
+    if (!lastArtifacts || busy || !referencesReady) return false;
     setGeneratingInteractive(true);
     try {
       const res = await fetch("/api/v1/interactive/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent: lastArtifacts.intent }),
+        body: JSON.stringify({
+          intent: lastArtifacts.intent,
+          ...referencePolicy,
+        }),
       });
       if (!res.ok) return false;
       const data = await res.json();
@@ -605,22 +941,20 @@ function App() {
   }
 
   async function uploadFile(file: File) {
+    if (busy) return;
+    setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
-    if (markReference) formData.append("is_reference", "true");
-    const marked = markReference;
-    setMarkReference(false);
     try {
       const res = await fetch("/api/v1/documents/upload", {
         method: "POST",
         body: formData,
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "上传失败");
       appendMessages({
         role: "assistant",
-        content: marked
-          ? `已上传参考资料「${file.name}」，正在解析入库，备课生成时将优先采用并在教案中注明来源。`
-          : `已上传「${file.name}」，正在解析入库，完成后可用于备课检索。`,
+        content: `已上传「${file.name}」，保存在当前会话。解析完成后可勾选为参考资料。`,
       });
       void data;
       setKbRefresh((n) => n + 1);
@@ -629,6 +963,8 @@ function App() {
         role: "assistant",
         content: `上传「${file.name}」失败`,
       });
+    } finally {
+      setUploading(false);
     }
   }
 
@@ -679,169 +1015,481 @@ function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <div className="logo">EduMind</div>
-        <div className="granularity" title="追问粒度（随会话保持）">
-          {(["快速", "标准", "精细"] as Granularity[]).map((g) => (
-            <button
-              key={g}
-              className={g === active.granularity ? "active" : ""}
-              onClick={() => updateActive(() => ({ granularity: g }))}
-            >
-              {g}
-            </button>
-          ))}
+      <aside
+        className={`conversation-sidebar${menuOpen ? " open" : ""}`}
+        aria-label="备课会话列表"
+      >
+        <div className="sidebar-brand">
+          <div className="logo">EduMind</div>
+          <button
+            className="sidebar-close"
+            aria-label="关闭会话列表"
+            onClick={() => setMenuOpen(false)}
+          >
+            ×
+          </button>
         </div>
-        <div className="spacer" />
+        <button
+          className="session-new"
+          disabled={busy}
+          onClick={() => setNewSessionOpen(true)}
+          aria-haspopup="dialog"
+        >
+          ＋ 新建备课
+        </button>
         <div className="session-wrap">
           <button
-            className={`ghost${menuOpen ? " menu-open" : ""}`}
-            onClick={() => {
-              setMenuOpen(!menuOpen);
-              setPendingDeleteId(null);
-            }}
+            className="ghost session-count"
+            onClick={() => setPendingDeleteId(null)}
           >
             会话（{store.sessions.length}）
           </button>
-          {menuOpen && (
-            <>
-              <div
-                className="menu-backdrop"
-                onClick={() => setMenuOpen(false)}
-              />
-              <div className="session-menu">
-                <button className="session-new" onClick={startNewSession}>
-                  ＋ 新建备课会话
-                </button>
-                <p className="session-hint">
-                  不同班级 / 课程的备课分开存放，仅保存在本浏览器
-                </p>
-                {sortedSessions.map((s) => (
-                  <div
-                    key={s.id}
-                    className={`session-item${s.id === active.id ? " active" : ""}`}
-                  >
-                    <div
-                      className="session-main"
-                      onClick={() => switchTo(s.id)}
-                    >
-                      <div className="session-name">
-                        {s.name}
-                        {s.id === active.id && (
-                          <span className="tag">当前</span>
-                        )}
-                      </div>
-                      <div className="session-meta">
-                        {formatTime(s.updatedAt)} · {s.messages.length} 条消息
-                        {s.artifacts ? " · 已有产物" : ""}
-                      </div>
-                    </div>
-                    <button
-                      className={`session-delete${pendingDeleteId === s.id ? " confirm" : ""}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteSession(s.id);
-                      }}
-                    >
-                      {pendingDeleteId === s.id ? "确认删除？" : "删除"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
         </div>
-        <button className="ghost">设置</button>
-      </header>
-
-      <div className="main">
-        <section className="chat-panel">
-          <div className="chat-history">
-            {active.messages.map((m, i) => (
-              <div key={i} className={`msg ${m.role}`}>
-                {m.content}
-              </div>
-            ))}
-          </div>
-          <div className="input-area">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".pdf,.doc,.docx,.ppt,.pptx,.png,.jpg,.jpeg,.mp4,.mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.amr"
-              style={{ display: "none" }}
-              onChange={handleFileChange}
-            />
-            <button
-              className="voice"
-              onClick={() => fileInputRef.current?.click()}
-              title="上传资料"
+        <div className="session-list">
+          {store.sessions.length === 0 && (
+            <p className="sidebar-empty">你的备课会保存在这里</p>
+          )}
+          {sortedSessions.map((s) => (
+            <div
+              key={s.id}
+              className={`session-item${s.id === active.id ? " active" : ""}`}
             >
-              📎
-            </button>
-            <button
-              className={markReference ? "voice ref-on" : "voice"}
-              onClick={() => setMarkReference(!markReference)}
-              title="标记为参考资料：下一个上传的资料在备课生成时优先采用，并在回复与教案中注明来源"
-            >
-              📌
-            </button>
-            <button
-              className={listening ? "voice listening" : "voice"}
-              onClick={toggleVoice}
-              title="语音输入"
-            >
-              {listening ? "🔴" : "🎤"}
-            </button>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && send()}
-              placeholder="输入教学需求，或上传资料建知识库…"
-            />
-            <button onClick={send} disabled={sending}>
-              {sending ? "备课中…" : "发送"}
-            </button>
-          </div>
-        </section>
-
-        <aside className="context-panel">
-          <div className="tabs">
-            {TABS.map((t) => (
-              <button
-                key={t}
-                className={t === activeTab ? "active" : ""}
-                onClick={() => setActiveTab(t)}
+              <div
+                className="session-main"
+                role="button"
+                tabIndex={busy ? -1 : 0}
+                aria-disabled={busy}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    switchTo(s.id);
+                  }
+                }}
+                onClick={() => switchTo(s.id)}
               >
-                {t}
+                <div className="session-name">
+                  {s.name}
+                  {s.id === active.id && <span className="tag">当前</span>}
+                </div>
+                <div className="session-meta">
+                  {formatTime(s.updatedAt)} · {s.messages.length} 条消息
+                  {s.artifacts ? " · 已有产物" : ""}
+                </div>
+              </div>
+              <button
+                disabled={busy}
+                className="session-rename"
+                aria-label={`重命名 ${s.name}`}
+                aria-haspopup="dialog"
+                onClick={() => {
+                  setPendingDeleteId(null);
+                  setRenamingId(s.id);
+                }}
+              >
+                重命名
+              </button>
+              <button
+                disabled={busy}
+                className={`session-delete${pendingDeleteId === s.id ? " confirm" : ""}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deleteSession(s.id);
+                }}
+              >
+                {pendingDeleteId === s.id ? "确认删除资料及会话？" : "删除"}
+              </button>
+            </div>
+          ))}
+        </div>
+        {sessionError && (
+          <p className="action-error" role="alert">
+            {sessionError}
+          </p>
+        )}
+        {busy && <p className="sidebar-note">任务完成后可切换会话</p>}
+        <button
+          className="sidebar-help"
+          aria-label="使用帮助"
+          aria-haspopup="dialog"
+          onClick={() => setHelpOpen(true)}
+        >
+          使用帮助
+        </button>
+      </aside>
+      {menuOpen && (
+        <div className="sidebar-overlay" onClick={() => setMenuOpen(false)} />
+      )}
+      <header className="topbar">
+        <button
+          className="sidebar-toggle"
+          aria-label="打开会话列表"
+          onClick={() => setMenuOpen(!menuOpen)}
+        >
+          ☰
+        </button>
+        <div className="thread-title">
+          {store.sessions.some((s) => s.id === active.id)
+            ? active.name
+            : "新建备课"}
+        </div>
+        <div className="spacer" />
+        {store.sessions.length > 0 && (
+          <div className="tabs" aria-label="教学材料入口">
+            {TABS.map((tab) => (
+              <button
+                key={tab}
+                className={materialsOpen && tab === activeTab ? "active" : ""}
+                onClick={() => {
+                  setActiveTab(tab);
+                  setMaterialsOpen(true);
+                }}
+              >
+                {tab}
               </button>
             ))}
           </div>
-          <div className="tab-content">
-            {activeTab === "知识库" && (
-              <KnowledgePanel refreshKey={kbRefresh} />
-            )}
-            {activeTab === "产物预览" && (
-              <PreviewPanel
-                key={active.id}
-                artifacts={active.artifacts}
-                revising={revising}
-                generatingInteractive={generatingInteractive}
-                onRevise={reviseArtifact}
-                onGenerateInteractive={generateInteractive}
-              />
-            )}
-            {activeTab === "冲突审核" && <ConflictPanel />}
-            {activeTab === "会话信息" && (
-              <SessionPanel
-                name={active.name}
-                granularity={active.granularity}
-                msgCount={active.messages.length}
-              />
+        )}
+      </header>
+
+      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      {newSessionOpen && (
+        <NewSessionDialog
+          onCreate={startNewSession}
+          onClose={() => setNewSessionOpen(false)}
+        />
+      )}
+      {renamingSession && (
+        <NewSessionDialog
+          key={renamingSession.id}
+          editing
+          initialName={renamingSession.name}
+          onCreate={renameSession}
+          onClose={() => setRenamingId(null)}
+        />
+      )}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg,.mp4,.mp3,.wav,.m4a,.aac,.flac,.ogg,.oga,.opus,.wma,.amr"
+        style={{ display: "none" }}
+        onChange={handleFileChange}
+      />
+
+      <div className={`main${materialsOpen ? " with-materials" : ""}`}>
+        <section className="chat-panel">
+          <div
+            className={`chat-history${active.messages.length === 1 ? " is-empty" : ""}`}
+            role="log"
+            aria-label="备课对话记录"
+            aria-live="polite"
+          >
+            {active.messages.length === 1 ? (
+              <div className="blank-thread">
+                <h1>这节课，想怎么讲？</h1>
+                <p>
+                  {store.sessions.length > 0
+                    ? "描述教学需求，选择要生成的材料。"
+                    : "新建备课会话，开始准备这节课。"}
+                </p>
+              </div>
+            ) : (
+              active.messages.map((m, i) => (
+                <div key={i} className={`msg ${m.role}`}>
+                  <span className="message-author">
+                    {m.role === "assistant" ? "EduMind" : "你"}
+                  </span>
+                  <div>{m.content}</div>
+                </div>
+              ))
             )}
           </div>
-        </aside>
+          {store.sessions.length > 0 && (
+            <div className="composer">
+              <fieldset className="output-options" disabled={busy}>
+                <legend>
+                  生成内容 <span>可多选</span>
+                </legend>
+                <div>
+                  {OUTPUT_OPTIONS.map((option) => (
+                    <label
+                      key={option.id}
+                      className={
+                        active.outputs.includes(option.id) ? "selected" : ""
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={active.outputs.includes(option.id)}
+                        onChange={() =>
+                          updateActive((s) => ({
+                            outputs: s.outputs.includes(option.id)
+                              ? s.outputs.filter((x) => x !== option.id)
+                              : [...s.outputs, option.id],
+                          }))
+                        }
+                      />
+                      {option.label}
+                    </label>
+                  ))}
+                </div>
+                {active.outputs.length === 0 && (
+                  <p role="status">请至少选择一种生成内容</p>
+                )}
+              </fieldset>
+
+              <div className="reference-controls">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={active.useReferenceMaterials}
+                    disabled={busy}
+                    onChange={(e) =>
+                      updateActive(() => ({
+                        useReferenceMaterials: e.target.checked,
+                      }))
+                    }
+                  />
+                  使用参考资料
+                </label>
+                {active.useReferenceMaterials ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveTab("知识库");
+                        setMaterialsOpen(true);
+                      }}
+                    >
+                      查看并勾选资料（已选 {selectedReferenceIds.length} 份）
+                    </button>
+                    <span>
+                      {referencesReady
+                        ? "仅参考勾选的文件"
+                        : "请在知识库中勾选已解析的资料"}
+                    </span>
+                  </>
+                ) : (
+                  <span>关闭时根据教学需求直接生成</span>
+                )}
+                {documentsError && (
+                  <span className="action-error" role="alert">
+                    {documentsError}
+                  </span>
+                )}
+              </div>
+              <div className="input-area">
+                <textarea
+                  rows={3}
+                  ref={teachingInputRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) =>
+                    e.key === "Enter" &&
+                    !e.shiftKey &&
+                    !e.nativeEvent.isComposing &&
+                    (e.preventDefault(), send())
+                  }
+                  placeholder="输入教学需求"
+                  aria-label="教学需求"
+                />
+                <ModeSelector
+                  value={active.granularity}
+                  disabled={busy}
+                  onChange={(granularity) =>
+                    updateActive(() => ({ granularity }))
+                  }
+                />
+                <button
+                  onClick={send}
+                  disabled={
+                    busy ||
+                    !input.trim() ||
+                    active.outputs.length === 0 ||
+                    !referencesReady
+                  }
+                >
+                  {sending ? "备课中…" : "发送"}
+                </button>
+              </div>
+              <div className="composer-footer">
+                <div className="composer-tools">
+                  <button
+                    className={listening ? "voice listening" : "voice"}
+                    onClick={toggleVoice}
+                    title="使用浏览器语音识别，将说话内容填入输入框"
+                    aria-label={listening ? "停止语音输入" : "语音输入"}
+                  >
+                    {listening ? "停止录入" : "语音输入"}
+                  </button>
+                </div>
+                <div className="composer-caption">
+                  <span className="mode-description">
+                    {MODE_DESCRIPTIONS[active.granularity]}
+                  </span>
+                  <span className="keyboard-hint">
+                    Enter 发送 · Shift + Enter 换行
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {materialsOpen && (
+          <aside className="context-panel">
+            <div className="materials-heading">
+              <h2>{activeTab}</h2>
+              <button
+                className="materials-close"
+                aria-label="关闭教学材料"
+                onClick={() => setMaterialsOpen(false)}
+                disabled={examBusy}
+              >
+                ×
+              </button>
+            </div>
+            <div className="tab-content">
+              {activeTab === "知识库" && (
+                <KnowledgePanel
+                  onUpload={() => fileInputRef.current?.click()}
+                  uploading={uploading}
+                  key={active.id}
+                  sessionId={active.id}
+                  refreshKey={kbRefresh}
+                  disabled={busy}
+                  docs={docs}
+                  useReferences={active.useReferenceMaterials}
+                  selectedIds={selectedReferenceIds}
+                  onToggleReference={toggleReference}
+                  onChange={(id) => {
+                    updateActive((s) => ({
+                      referenceDocIds: s.referenceDocIds.filter(
+                        (x) => x !== id,
+                      ),
+                    }));
+                    setKbRefresh((n) => n + 1);
+                  }}
+                />
+              )}
+              {activeTab === "产物预览" && (
+                <PreviewPanel
+                  key={active.id}
+                  referencePolicy={referencePolicy}
+                  disabledBusy={busy || !referencesReady}
+                  sessionId={active.id}
+                  exam={active.exam ?? null}
+                  setExam={(exam) => updateActive(() => ({ exam }))}
+                  onBusy={setExamBusy}
+                  artifacts={active.artifacts}
+                  revising={revising}
+                  generatingInteractive={generatingInteractive}
+                  onRevise={reviseArtifact}
+                  onGenerateInteractive={generateInteractive}
+                />
+              )}
+              {activeTab === "冲突审核" && (
+                <ConflictPanel key={active.id} sessionId={active.id} />
+              )}
+            </div>
+          </aside>
+        )}
       </div>
     </div>
+  );
+}
+
+function App() {
+  const [store, setStore] = useState<SessionStore>(
+    () => loadSessionStore() ?? freshStore(),
+  );
+  const [migrationError, setMigrationError] = useState("");
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    saveSessionStore(store);
+  }, [store]);
+  useEffect(() => {
+    let cancelled = false;
+    async function migrate() {
+      try {
+        const stored = loadSessionStore() ?? freshStore();
+        for (const session of stored.sessions) {
+          const a = session.artifacts;
+          const filenames = [
+            a?.ppt?.filename,
+            a?.word?.filename,
+            a?.interactive?.filename,
+            session.exam?.filename,
+          ].filter((x): x is string => !!x);
+          if (filenames.length) {
+            const res = await sessionFetch(
+              session.id,
+              "/api/v1/sessions/import-files",
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ filenames }),
+              },
+            );
+            if (!res.ok)
+              throw new Error("旧教学材料暂时无法恢复，请检查后端服务后刷新。");
+          }
+        }
+        const response = await window.fetch("/api/v1/sessions/legacy");
+        if (!response.ok)
+          throw new Error("资料服务暂时不可用，请启动后端后刷新。");
+        const legacy = await response.json();
+        if (cancelled) return;
+        if (legacy.document_count > 0)
+          setStore((st) => {
+            if (st.sessions.some((s) => s.id === "legacy")) return st;
+            const archive = {
+              ...createSession(),
+              id: "legacy",
+              name: "以前的资料",
+            };
+            return {
+              ...st,
+              activeId: st.activeId || archive.id,
+              sessions: [...st.sessions, archive],
+            };
+          });
+        setReady(true);
+      } catch (e) {
+        if (!cancelled)
+          setMigrationError(
+            e instanceof Error ? e.message : "资料恢复失败，请刷新重试。",
+          );
+      }
+    }
+    void migrate();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const active = store.sessions.find((s) => s.id === store.activeId);
+  const isEmpty = store.sessions.length === 0;
+  const blank = useMemo(() => (isEmpty ? createSession() : null), [isEmpty]);
+  if (!ready)
+    return (
+      <div className="startup-state">
+        <div className="logo">EduMind</div>
+        <p role={migrationError ? "alert" : "status"}>
+          {migrationError || "正在准备你的备课空间…"}
+        </p>
+        {migrationError && (
+          <button onClick={() => window.location.reload()}>重新加载</button>
+        )}
+      </div>
+    );
+  const current = active ?? blank!;
+  return (
+    <Workspace
+      key={current.id}
+      active={current}
+      store={store}
+      setStore={setStore}
+      initialDraft=""
+    />
   );
 }
 

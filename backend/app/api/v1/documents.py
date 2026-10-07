@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db import get_session
@@ -14,6 +14,18 @@ from app.knowledge.storage import save_upload
 router = APIRouter()
 
 DEFAULT_USER_ID = "default"
+
+
+@router.delete("/documents/{doc_id}")
+def delete_document(doc_id: str, db: Annotated[Session, Depends(get_session)]):
+    from app.knowledge.cleanup import remove_document
+
+    doc = db.get(Document, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="当前会话没有这份资料")
+    remove_document(db, doc)
+    db.commit()
+    return {"id": doc_id, "status": "deleted"}
 
 
 @router.post("/documents/upload")

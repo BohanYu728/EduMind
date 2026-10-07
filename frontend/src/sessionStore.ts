@@ -1,19 +1,31 @@
 // 备课会话浏览器本地持久化（DESIGN §6.1 会话持久化 v3）：
 // 消息 + 生成物 + 追问粒度随会话存 localStorage，刷新/重开浏览器完整恢复；
 // 支持多会话切换；不建服务端会话实体。
-// 任何读写失败（隐私模式/配额满/脏数据）一律降级：读失败回全新会话，写失败静默跳过，
+// 任何读写失败（隐私模式/配额满/脏数据）一律降级：读失败回空会话列表，写失败静默跳过，
 // 不阻断备课主流程与现场演示。
 
-import type { Artifacts, Granularity, Message } from "./types";
+import {
+  DEFAULT_OUTPUTS,
+  type OutputType,
+  type Artifacts,
+  type Granularity,
+  type Message,
+  type ExamPaper,
+} from "./types";
 
 export interface StoredSession {
   id: string;
   name: string;
+  nameManuallySet?: boolean;
   createdAt: string;
   updatedAt: string;
   granularity: Granularity;
+  outputs: OutputType[];
+  useReferenceMaterials: boolean;
+  referenceDocIds: string[];
   messages: Message[];
   artifacts: Artifacts | null;
+  exam?: ExamPaper | null;
 }
 
 export interface SessionStore {
@@ -46,6 +58,9 @@ export function createSession(now = new Date()): StoredSession {
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
     granularity: "标准",
+    outputs: [...DEFAULT_OUTPUTS],
+    useReferenceMaterials: false,
+    referenceDocIds: [],
     messages: [{ ...GREETING }],
     artifacts: null,
   };
@@ -85,24 +100,31 @@ function isMessages(v: unknown): v is Message[] {
 function toArtifacts(v: unknown): Artifacts | null {
   if (typeof v !== "object" || v === null) return null;
   const a = v as Artifacts;
-  if (!Array.isArray(a.ppt?.slides) || typeof a.word?.filename !== "string") {
-    return null;
-  }
+  const validPpt =
+    a.ppt && Array.isArray(a.ppt.slides) && typeof a.ppt.filename === "string";
+  const validWord = a.word && typeof a.word.filename === "string";
+  if (!validPpt && !validWord && !a.outline && !a.interactive) return null;
   return {
     ...a,
     intent: typeof a.intent?.topic === "string" ? a.intent : { topic: "" },
     knowledge_hits: a.knowledge_hits === true,
     references: Array.isArray(a.references) ? a.references : [],
-    ppt: {
-      slides: a.ppt.slides,
-      path: a.ppt.path ?? "",
-      filename: a.ppt.filename,
-    },
-    word: {
-      data: a.word.data,
-      path: a.word.path ?? "",
-      filename: a.word.filename,
-    },
+    ppt:
+      validPpt && a.ppt
+        ? {
+            slides: a.ppt.slides,
+            path: a.ppt.path ?? "",
+            filename: a.ppt.filename,
+          }
+        : null,
+    word:
+      validWord && a.word
+        ? {
+            data: a.word.data,
+            path: a.word.path ?? "",
+            filename: a.word.filename,
+          }
+        : null,
     outline: typeof a.outline === "string" ? a.outline : "",
   };
 }
@@ -121,12 +143,36 @@ function toSession(v: unknown): StoredSession | null {
     updatedAt:
       typeof s.updatedAt === "string" ? s.updatedAt : new Date(0).toISOString(),
     granularity: s.granularity,
+    outputs:
+      Array.isArray(s.outputs) &&
+      s.outputs.some((x) =>
+        ["ppt", "word", "outline", "interactive"].includes(x),
+      )
+        ? [
+            ...new Set(
+              s.outputs.filter((x) =>
+                ["ppt", "word", "outline", "interactive"].includes(x),
+              ),
+            ),
+          ]
+        : [...DEFAULT_OUTPUTS],
+    useReferenceMaterials: s.useReferenceMaterials === true,
+    nameManuallySet: s.nameManuallySet === true,
+    referenceDocIds: Array.isArray(s.referenceDocIds)
+      ? s.referenceDocIds.filter((id) => typeof id === "string")
+      : [],
     messages: s.messages,
     artifacts: toArtifacts(s.artifacts),
+    exam:
+      s.exam &&
+      Array.isArray(s.exam.questions) &&
+      typeof s.exam.filename === "string"
+        ? s.exam
+        : null,
   };
 }
 
-/** 读取并整卷校验；缺失/损坏/指向失效一律返回 null，由调用方回落全新会话。 */
+/** 读取并整卷校验；缺失/损坏/指向失效一律返回 null，由调用方回落空会话列表。 */
 export function loadSessionStore(): SessionStore | null {
   try {
     const raw = localStorage.getItem(SESSIONS_KEY);
@@ -134,17 +180,14 @@ export function loadSessionStore(): SessionStore | null {
     const data: unknown = JSON.parse(raw);
     if (typeof data !== "object" || data === null) return null;
     const d = data as SessionStore;
-    if (
-      d.version !== 1 ||
-      !Array.isArray(d.sessions) ||
-      d.sessions.length === 0
-    ) {
+    if (d.version !== 1 || !Array.isArray(d.sessions)) {
       return null;
     }
     const sessions = d.sessions
       .map(toSession)
       .filter((s): s is StoredSession => s !== null);
-    if (sessions.length === 0) return null;
+    if (sessions.length === 0)
+      return { version: 1, activeId: "", sessions: [] };
     const activeId = sessions.some((s) => s.id === d.activeId)
       ? d.activeId
       : sessions[0].id;
@@ -163,9 +206,8 @@ export function saveSessionStore(store: SessionStore): void {
   }
 }
 
-export function freshStore(now = new Date()): SessionStore {
-  const s = createSession(now);
-  return { version: 1, activeId: s.id, sessions: [s] };
+export function freshStore(): SessionStore {
+  return { version: 1, activeId: "", sessions: [] };
 }
 
 /** 对当前会话做纯函数更新，并刷新其 updatedAt（会话列表按最近使用排序）。 */
@@ -182,7 +224,7 @@ export function mapActiveSession(
   };
 }
 
-/** 删除会话；删的是当前会话则切到最近更新的剩余会话，删空则回落全新会话。 */
+/** 删除会话；删的是当前会话则切到最近更新的剩余会话，删空则保留空状态并展示欢迎页。 */
 export function removeSession(store: SessionStore, id: string): SessionStore {
   const sessions = store.sessions.filter((s) => s.id !== id);
   if (sessions.length === 0) return freshStore();
